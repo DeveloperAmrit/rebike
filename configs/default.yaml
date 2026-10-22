@@ -1,0 +1,47 @@
+# ReBike default configuration
+
+data:
+  region: JC              # JC = Jersey City/Hoboken (small files); NYC = Manhattan/Brooklyn/... (~1 GB/month)
+  months: ["202406", "202407", "202408", "202409", "202410"]
+  n_stations: 30
+  weekdays_only: true
+  raw_dir: data/raw
+  out: data/processed/demand_JC.npz
+
+env:
+  model_path: data/processed/demand_JC.npz
+  start_hour: 6
+  end_hour: 22
+  tick_min: 5
+  truck_capacity: 20
+  truck_speed_kmh: 18.0
+  handling_min: 3.0
+  transfer_levels: [-10, -5, -2, 0, 2, 5, 10]
+  init_fill_low: 0.3
+  init_fill_high: 0.7
+  demand_noise_sigma: 0.15
+  w_served: 1.0
+  w_lost: 0.0
+  w_km: 0.5
+  w_dock: 0.1
+
+ppo:
+  total_timesteps: 300000
+  n_envs: 8
+  n_steps: 256
+  batch_size: 512
+  n_epochs: 10
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  net_arch: [256, 256]
+  seed: 0
+  model_dir: models
+  log_dir: results/tb
+
+eval:
+  episodes: 30
+  seed: 1000
+  out_dir: results
