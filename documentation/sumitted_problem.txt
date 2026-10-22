@@ -1,0 +1,1 @@
+ReBike: Empty or full bike-share stations lose rides. Using a demand simulator built from millions of Citi Bike trips, we model rebalancing as an MDP. State: station inventories, hour, truck location. Action: next station and bikes moved. Reward: served trips minus travel cost. PPO is compared against threshold-based rebalancing.

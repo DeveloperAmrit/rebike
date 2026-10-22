@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# data (regenerate with scripts/prepare_data.py)
+data/raw/
+data/processed/*.npz
+
+# training outputs
+models/checkpoints/
+results/tb/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+documentation/*.pdf
