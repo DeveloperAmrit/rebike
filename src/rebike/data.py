@@ -21,6 +21,7 @@ import pandas as pd
 import requests
 
 TRIPDATA_URL = "https://s3.amazonaws.com/tripdata/{name}"
+GBFS_STATION_INFO = "https://gbfs.citibikenyc.com/gbfs/en/station_information.json"
 USECOLS = [
     "started_at", "ended_at",
     "start_station_id", "end_station_id",
@@ -122,19 +123,47 @@ def haversine_km(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return 2 * 6371.0 * np.arcsin(np.sqrt(h))
 
 
+def fetch_dock_capacity(min_docks: int = 5) -> dict[str, int]:
+    """Real dock counts from the live Citi Bike GBFS feed, keyed by trip-data station id.
+
+    Trip archives use the GBFS `short_name` (e.g. 'JC115', 'HB102'). Stations
+    reporting fewer than `min_docks` docks (inactive / being serviced) are skipped.
+    """
+    r = requests.get(GBFS_STATION_INFO, timeout=60)
+    r.raise_for_status()
+    out = {}
+    for s in r.json()["data"]["stations"]:
+        sid, cap = str(s.get("short_name", "")), int(s.get("capacity") or 0)
+        if sid and cap >= min_docks:
+            out[sid] = cap
+    return out
+
+
 def build_demand_model(
     df: pd.DataFrame,
     n_stations: int = 30,
     weekdays_only: bool = True,
     detour_factor: float = 1.35,
     od_smoothing: float = 0.05,
+    station_ids: np.ndarray | None = None,
+    dock_capacity: dict[str, int] | None = None,
 ) -> DemandModel:
+    """Estimate the demand model.
+
+    station_ids   reuse a fixed station set (e.g. the training set when building
+                  the held-out test model); default = the `n_stations` busiest.
+    dock_capacity real dock counts {station_id: docks}; stations missing from it
+                  fall back to a throughput-based estimate.
+    """
     if weekdays_only:
         df = df[df["started_at"].dt.dayofweek < 5]
 
-    # busiest stations by total activity
-    activity = pd.concat([df["start_station_id"], df["end_station_id"]]).value_counts()
-    ids = activity.index[:n_stations].to_numpy()
+    if station_ids is None:
+        # busiest stations by total activity
+        activity = pd.concat([df["start_station_id"], df["end_station_id"]]).value_counts()
+        ids = activity.index[:n_stations].to_numpy()
+    else:
+        ids = np.asarray(station_ids)
     idx = {s: k for k, s in enumerate(ids)}
     df = df[df["start_station_id"].isin(idx) & df["end_station_id"].isin(idx)].copy()
     df["i"] = df["start_station_id"].map(idx)
@@ -143,8 +172,12 @@ def build_demand_model(
     n_days = df["started_at"].dt.normalize().nunique()
     N = len(ids)
 
-    # coordinates: median of reported start positions
-    coords = df.groupby("i")[["start_lat", "start_lng"]].median().reindex(range(N)).to_numpy()
+    # coordinates: median of reported start positions (fall back to end positions)
+    start = df.groupby("i")[["start_lat", "start_lng"]].median().reindex(range(N))
+    end = df.groupby("j")[["end_lat", "end_lng"]].median().reindex(range(N))
+    coords = start.to_numpy().copy()
+    miss = np.isnan(coords[:, 0])
+    coords[miss] = end.to_numpy()[miss]
 
     # departure rates
     counts = np.zeros((24, N))
@@ -173,6 +206,10 @@ def build_demand_model(
     np.add.at(arr, (df["h"].to_numpy(), df["j"].to_numpy()), 1)
     peak = np.maximum(dep_rate, arr / max(n_days, 1)).max(0)
     capacity = np.clip(np.round(15 + 2.0 * peak), 15, 45).astype(int)
+    if dock_capacity:
+        real = np.array([dock_capacity.get(s, -1) for s in ids])
+        capacity = np.where(real > 0, real, capacity).astype(int)
+        print(f"[data] real dock counts for {(real > 0).sum()}/{N} stations")
 
     return DemandModel(
         station_ids=ids.astype(str), coords=coords, capacity=capacity,

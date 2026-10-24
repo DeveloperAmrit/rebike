@@ -60,3 +60,33 @@ def test_baselines_run(toy_model, cls):
         obs, r, term, trunc, info = env.step(pol.act(obs))
         done = term or trunc
     assert 0 <= info["service_rate"] <= 1
+
+
+def test_warm_start_keeps_fleet_size(toy_model):
+    cfg = EnvConfig(init_mode="warm", fleet_fill=0.4)
+    env = RebalancingEnv(cfg, toy_model)
+    expected = np.round(0.4 * env.cap).sum()
+    for s in range(3):
+        env.reset(seed=s)
+        assert env.inv.sum() == expected
+        assert (env.inv >= 0).all() and (env.inv <= env.cap).all()
+
+
+def test_action_mask_matches_feasibility(toy_model):
+    env = RebalancingEnv(EnvConfig(), toy_model)
+    rng = np.random.default_rng(3)
+    for s in range(20):
+        env.reset(seed=s)
+        env.truck_load = int(rng.integers(0, env.cfg.truck_capacity + 1))
+        env.inv = rng.integers(0, env.cap + 1)
+        mask = env.action_masks().reshape(env.N, env.K)
+        assert mask[:, env.zero_level].all()
+        for j in range(env.N):
+            drop = min(env.truck_load, env.cap[j] - env.inv[j])
+            pick = min(env.cfg.truck_capacity - env.truck_load, env.inv[j])
+            for k, x in enumerate(env.levels):
+                feasible = drop if x > 0 else pick if x < 0 else 1
+                if mask[j, k] and x != 0:
+                    assert feasible > 0           # an allowed transfer always moves bikes
+                if feasible >= abs(x) and x != 0:
+                    assert mask[j, k]             # every exactly-feasible transfer allowed
