@@ -2,14 +2,17 @@
 
 data:
   region: JC              # JC = Jersey City/Hoboken (small files); NYC = Manhattan/Brooklyn/... (~1 GB/month)
-  months: ["202406", "202407", "202408", "202409", "202410"]
-  n_stations: 30
+  train_months: ["202406", "202407", "202408", "202409"]
+  test_months: ["202410"]           # held out: agent is evaluated on unseen days
+  n_stations: 60
   weekdays_only: true
   raw_dir: data/raw
-  out: data/processed/demand_JC.npz
+  dock_capacity: data/dock_capacity.json   # cached GBFS dock counts
+  out_train: data/processed/demand_train.npz
+  out_test: data/processed/demand_test.npz
 
 env:
-  model_path: data/processed/demand_JC.npz
+  model_path: data/processed/demand_train.npz
   start_hour: 6
   end_hour: 22
   tick_min: 5
@@ -17,16 +20,18 @@ env:
   truck_speed_kmh: 18.0
   handling_min: 3.0
   transfer_levels: [-10, -5, -2, 0, 2, 5, 10]
-  init_fill_low: 0.3
-  init_fill_high: 0.7
+  init_mode: warm
+  fleet_fill: 0.4
+  overnight_rebalance: 0.3
   demand_noise_sigma: 0.15
-  w_served: 1.0
-  w_lost: 0.0
-  w_km: 0.5
-  w_dock: 0.1
+  # reward = w_served*served - w_lost*lost - w_km*km - w_dock*failed_docks
+  w_served: 0.0
+  w_lost: 1.0
+  w_km: 0.2
+  w_dock: 0.25
 
 ppo:
-  total_timesteps: 300000
+  total_timesteps: 1500000
   n_envs: 8
   n_steps: 256
   batch_size: 512
@@ -41,7 +46,16 @@ ppo:
   model_dir: models
   log_dir: results/tb
 
+threshold_tuning:
+  episodes: 10
+  seed: 5000
+  low: [0.1, 0.15, 0.2, 0.25, 0.3]
+  high: [0.7, 0.75, 0.8, 0.85, 0.9]
+  target: [0.4, 0.5, 0.6]
+  out: results/threshold_tuned.json
+
 eval:
+  model_path: data/processed/demand_test.npz
   episodes: 30
   seed: 1000
   out_dir: results

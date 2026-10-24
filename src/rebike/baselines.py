@@ -12,10 +12,9 @@ class NoRebalancing:
 
     def __init__(self, env: RebalancingEnv):
         self.env = env
-        self.zero = int(np.argmin(np.abs(env.levels)))
 
     def act(self, obs):
-        return np.array([self.env.truck_pos, self.zero])
+        return self.env.encode(self.env.truck_pos, self.env.zero_level)
 
 
 class ThresholdPolicy:
@@ -27,9 +26,14 @@ class ThresholdPolicy:
     """
     name = "threshold"
 
+    @classmethod
+    def from_params(cls, env, params: dict, name: str = "threshold"):
+        pol = cls(env, **params)
+        pol.name = name
+        return pol
+
     def __init__(self, env: RebalancingEnv, low=0.2, high=0.8, target=0.5):
         self.env, self.low, self.high, self.target = env, low, high, target
-        self.zero = int(np.argmin(np.abs(env.levels)))
 
     def _level(self, want: int) -> int:
         return int(np.argmin(np.abs(self.env.levels - want)))
@@ -46,12 +50,12 @@ class ThresholdPolicy:
         if e.truck_load >= 2 and len(empty):
             score = (goal[empty] - e.inv[empty]) / (1.0 + dist[empty])
             j = int(empty[np.argmax(score)])
-            return np.array([j, self._level(min(goal[j] - e.inv[j], e.truck_load))])
+            return e.encode(j, self._level(min(goal[j] - e.inv[j], e.truck_load)))
 
         space = e.cfg.truck_capacity - e.truck_load
         if space >= 2 and len(full):
             score = (e.inv[full] - goal[full]) / (1.0 + dist[full])
             j = int(full[np.argmax(score)])
-            return np.array([j, self._level(-min(e.inv[j] - goal[j], space))])
+            return e.encode(j, self._level(-min(e.inv[j] - goal[j], space)))
 
-        return np.array([e.truck_pos, self.zero])
+        return e.encode(e.truck_pos, e.zero_level)

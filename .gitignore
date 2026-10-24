@@ -19,3 +19,4 @@ results/tb/
 .vscode/
 .idea/
 documentation/*.pdf
+results/train_log.txt

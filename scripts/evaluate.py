@@ -1,9 +1,14 @@
-"""Compare PPO against the no-rebalancing and threshold baselines.
+"""Compare PPO against the baselines on held-out (test-month) demand.
 
     python scripts/evaluate.py --config configs/default.yaml --model models/ppo_rebike.zip
-Writes results/eval_summary.csv, results/eval_episodes.csv and results/eval_comparison.png
+
+Every policy is run on the same seeded days (same demand, same morning state).
+Policies: no rebalancing, threshold with default settings, threshold with tuned
+settings (results/threshold_tuned.json, if present), and the trained PPO agent.
+Writes results/eval_summary.csv, results/eval_episodes.csv, results/eval_comparison.png
 """
 import argparse
+import json
 from pathlib import Path
 
 import matplotlib
@@ -21,13 +26,14 @@ from rebike.env import RebalancingEnv
 class PPOPolicy:
     name = "ppo"
 
-    def __init__(self, path):
-        from stable_baselines3 import PPO
-        self.model = PPO.load(path, device="cpu")
+    def __init__(self, path, env):
+        from sb3_contrib import MaskablePPO
+        self.model = MaskablePPO.load(path, device="cpu")
+        self.env = env
 
     def act(self, obs):
-        a, _ = self.model.predict(obs, deterministic=True)
-        return a
+        a, _ = self.model.predict(obs, action_masks=self.env.action_masks(), deterministic=True)
+        return int(a)
 
 
 def run_episode(env, policy, seed):
@@ -43,8 +49,9 @@ def run_episode(env, policy, seed):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/default.yaml")
-    p.add_argument("--model", default=None, help="path to trained PPO .zip (optional)")
+    p.add_argument("--model", default=None, help="trained PPO .zip (optional)")
     p.add_argument("--episodes", type=int, default=None)
+    p.add_argument("--demand", default=None, help="demand model .npz (default: eval.model_path = test month)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -53,11 +60,15 @@ def main():
     out = Path(ec["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
 
-    demand = DemandModel.load(Path(cfg["env"].model_path))
+    demand = DemandModel.load(Path(args.demand or ec["model_path"]))
     env = RebalancingEnv(cfg["env"], demand)
-    policies = [NoRebalancing(env), ThresholdPolicy(env)]
+    policies = [NoRebalancing(env), ThresholdPolicy.from_params(env, {}, "threshold_default")]
+    tuned = Path(cfg["threshold_tuning"]["out"])
+    if tuned.exists():
+        params = json.loads(tuned.read_text())["best"]
+        policies.append(ThresholdPolicy.from_params(env, params, "threshold_tuned"))
     if args.model:
-        policies.append(PPOPolicy(args.model))
+        policies.append(PPOPolicy(args.model, env))
 
     rows = []
     for pol in policies:
@@ -72,12 +83,15 @@ def main():
     summary.to_csv(out / "eval_summary.csv")
     print(summary.round(3).to_string())
 
-    fig, ax = plt.subplots(1, 3, figsize=(12, 3.5))
-    for a, c, t in zip(ax, ["service_rate", "lost", "km"],
-                       ["Service rate", "Lost trips / day", "Truck km / day"]):
-        df.boxplot(column=c, by="policy", ax=a, grid=False)
-        a.set_title(t); a.set_xlabel("")
-    fig.suptitle("")
+    order = [p.name for p in policies]
+    fig, ax = plt.subplots(1, 4, figsize=(15, 3.6))
+    for a, c, t in zip(ax, ["ret", "service_rate", "lost", "km"],
+                       ["Episode return", "Service rate", "Lost trips / day", "Truck km / day"]):
+        a.boxplot([df.loc[df.policy == n, c] for n in order], showfliers=False)
+        a.set_xticks(range(1, len(order) + 1), [n.replace("_", "\n") for n in order], fontsize=8)
+        a.set_title(t)
+        a.grid(axis="y", alpha=0.3)
+    fig.suptitle(f"Held-out evaluation ({n_ep} simulated weekdays, {len(demand.station_ids)} stations)")
     fig.tight_layout()
     fig.savefig(out / "eval_comparison.png", dpi=150)
     print(f"[eval] wrote {out}/eval_summary.csv and eval_comparison.png")
