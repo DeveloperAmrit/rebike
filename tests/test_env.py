@@ -90,3 +90,43 @@ def test_action_mask_matches_feasibility(toy_model):
                     assert feasible > 0           # an allowed transfer always moves bikes
                 if feasible >= abs(x) and x != 0:
                     assert mask[j, k]             # every exactly-feasible transfer allowed
+
+
+def test_extra_features_and_hourly_stats(toy_model):
+    from dataclasses import replace
+    base = EnvConfig()
+    full = RebalancingEnv(base, toy_model)
+    slim = RebalancingEnv(replace(base, extra_features=False), toy_model)
+    assert full.observation_space.shape == (6 * full.N + 3,)
+    assert slim.observation_space.shape == (4 * slim.N + 3,)
+    # observations never consume randomness: same seed + same actions -> same day
+    o1, _ = full.reset(seed=4)
+    o2, _ = slim.reset(seed=4)
+    assert np.allclose(o1[: 4 * full.N + 3], o2)
+    done = False
+    while not done:
+        a = full.encode(full.truck_pos, full.zero_level)
+        _, _, t1, _, i1 = full.step(a)
+        _, _, t2, _, i2 = slim.step(a)
+        done = t1
+    assert i1["served"] == i2["served"] and i1["lost"] == i2["lost"]
+    assert full.hourly_served.sum() == i1["served"]
+    assert full.hourly_demand.sum() == i1["demand"]
+
+
+def test_demand_scale_increases_demand(toy_model):
+    from dataclasses import replace
+    lo = RebalancingEnv(replace(EnvConfig(), demand_scale=0.5), toy_model)
+    hi = RebalancingEnv(replace(EnvConfig(), demand_scale=2.0), toy_model)
+    tot = []
+    for env in (lo, hi):
+        d = 0
+        for s in range(3):
+            env.reset(seed=s)
+            done = False
+            while not done:
+                *_, term, _, info = env.step(env.encode(env.truck_pos, env.zero_level))
+                done = term
+            d += info["demand"]
+        tot.append(d)
+    assert tot[1] > 2 * tot[0]

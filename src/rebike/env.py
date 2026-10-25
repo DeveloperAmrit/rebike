@@ -14,13 +14,16 @@ their trips, and an overnight crew restores a fraction `overnight_rebalance`
 of each station's deviation from the fleet average. Stations therefore begin
 the morning in the imbalanced state that commuting patterns actually produce.
 
-Observation (float32, dim 4N + 3)
+Observation (float32, dim 4N + 3; 6N + 3 with `extra_features`)
     inv / cap                 (N)  fill level of every station
     one-hot truck location    (N)
     truck load / truck cap    (1)
     sin, cos of time-of-day   (2)
     expected net inflow over next hour / cap   (N)
     bikes already in transit to station (next 30 min) / cap   (N)
+  extra_features (default on):
+    truck travel time to each station / 30 min                (N)
+    projected fill in 1 h = inv/cap + net inflow + in transit, clipped to [-0.5, 1.5]  (N)
 
 Action: Discrete(N * K), a = station * K + level
     station = where the truck drives next, level indexes `transfer_levels`
@@ -58,6 +61,8 @@ class EnvConfig:
     init_fill_low: float = 0.3         # uniform mode
     init_fill_high: float = 0.7        # uniform mode
     demand_noise_sigma: float = 0.15   # day-level log-normal demand multiplier
+    demand_scale: float = 1.0          # global demand multiplier (robustness tests)
+    extra_features: bool = True        # travel-time + projected-fill observations
     w_served: float = 0.0
     w_lost: float = 1.0
     w_km: float = 0.2
@@ -87,7 +92,9 @@ class RebalancingEnv(gym.Env):
         self.od_cdf = np.cumsum(self.m.od_prob, axis=-1)  # for vectorised destination sampling
 
         self.action_space = spaces.Discrete(self.N * self.K)
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(4 * self.N + 3,), dtype=np.float32)
+        self.travel_min = self.m.dist_km / self.cfg.truck_speed_kmh * 60 + self.cfg.handling_min
+        obs_dim = (6 if self.cfg.extra_features else 4) * self.N + 3
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
 
     # ------------------------------------------------------------------ #
     def encode(self, station: int, level: int) -> int:
@@ -124,7 +131,7 @@ class RebalancingEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         rng = self.np_random
-        self.day_scale = float(np.exp(rng.normal(0.0, self.cfg.demand_noise_sigma)))
+        self.day_scale = float(np.exp(rng.normal(0.0, self.cfg.demand_noise_sigma))) * self.cfg.demand_scale
         if self.cfg.init_mode == "warm":
             self.inv = self._warm_start()
         else:
@@ -135,6 +142,9 @@ class RebalancingEnv(gym.Env):
         self.t = 0  # minutes since start_hour
         self.in_transit = np.zeros((self.n_ticks + self.max_ride + 1, self.N), dtype=np.int64)
         self.stats = dict(served=0, lost=0, km=0.0, moved=0, failed_docks=0, demand=0)
+        n_hours = self.cfg.end_hour - self.cfg.start_hour
+        self.hourly_served = np.zeros(n_hours, dtype=np.int64)
+        self.hourly_demand = np.zeros(n_hours, dtype=np.int64)
         return self._obs(), self._info()
 
     def _warm_start(self) -> np.ndarray:
@@ -241,6 +251,9 @@ class RebalancingEnv(gym.Env):
         self.stats["lost"] += lost
         self.stats["failed_docks"] += failed
         self.stats["demand"] += int(demand.sum())
+        if hasattr(self, "hourly_served") and self.t < self.horizon:
+            self.hourly_served[self.t // 60] += served
+            self.hourly_demand[self.t // 60] += int(demand.sum())
         self.t += self.cfg.tick_min
         return served, lost, failed
 
@@ -253,14 +266,18 @@ class RebalancingEnv(gym.Env):
         pos[self.truck_pos] = 1.0
         net = (self.arr_rate[h] - self.m.dep_rate[h]) * self.day_scale / self.cap
         soon = self.in_transit[k : k + max(1, 30 // self.cfg.tick_min)].sum(0) / self.cap
-        return np.concatenate([
+        parts = [
             self.inv / self.cap,
             pos,
             [self.truck_load / self.cfg.truck_capacity],
             [np.sin(2 * np.pi * frac), np.cos(2 * np.pi * frac)],
             net,
             soon,
-        ]).astype(np.float32)
+        ]
+        if self.cfg.extra_features:
+            parts.append(self.travel_min[self.truck_pos] / 30.0)
+            parts.append(np.clip(self.inv / self.cap + net + soon, -0.5, 1.5))
+        return np.concatenate(parts).astype(np.float32)
 
     def _info(self):
         d = dict(self.stats)
