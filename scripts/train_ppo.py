@@ -32,6 +32,17 @@ from rebike.env import RebalancingEnv, make_env
 INFO_KEYS = ("served", "lost", "km", "service_rate")
 
 
+def fixed_seed(eval_cls, seed: int):
+    """Eval callback that re-seeds the validation env before every evaluation, so
+    each evaluation scores the policy on the *same* validation days."""
+    class FixedSeedEval(eval_cls):
+        def _on_step(self) -> bool:
+            if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+                self.eval_env.seed(seed)
+            return super()._on_step()
+    return FixedSeedEval
+
+
 def linear_schedule(start: float, end_frac: float):
     """Learning rate decays linearly from `start` to `start * end_frac`."""
     def f(progress_remaining: float) -> float:
@@ -80,7 +91,7 @@ def main():
     eval_env.seed(pc.get("val_seed", 7000))
     # same wrapper type as training (required by SB3), but raw rewards and no stat updates
     eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, training=False)
-    eval_cls = EvalCallback if args.no_mask else MaskableEvalCallback
+    eval_cls = fixed_seed(EvalCallback if args.no_mask else MaskableEvalCallback, pc.get("val_seed", 7000))
     evaluator = eval_cls(
         eval_env, n_eval_episodes=pc.get("eval_episodes", 10),
         eval_freq=max(pc.get("eval_freq", 100_000) // pc["n_envs"], 1),
