@@ -8,6 +8,7 @@ Writes results/threshold_tuned.json (all grid points + best).
 """
 import argparse
 import itertools
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -29,7 +30,7 @@ def evaluate(env, params, seeds):
             obs, r, term, trunc, info = env.step(pol.act(obs))
             ret += r
             done = term or trunc
-        rets.append(ret)
+        rets.append(info["abs_ret"])   # absolute reward, comparable across reward modes
         service.append(info["service_rate"])
     return float(np.mean(rets)), float(np.mean(service))
 
@@ -41,7 +42,8 @@ def main():
     cfg = load_config(args.config)
     tc = cfg["threshold_tuning"]
 
-    env = RebalancingEnv(cfg["env"], DemandModel.load(Path(cfg["env"].model_path)))
+    env_cfg = replace(cfg["env"], action_mode="amount")   # threshold uses bike-amount actions
+    env = RebalancingEnv(env_cfg, DemandModel.load(Path(cfg["env"].model_path)))
     seeds = [tc["seed"] + i for i in range(tc["episodes"])]
     grid = [dict(low=l, high=h, target=t)
             for l, h, t in itertools.product(tc["low"], tc["high"], tc["target"]) if l < t < h]

@@ -20,6 +20,8 @@ env:
   truck_speed_kmh: 18.0
   handling_min: 3.0
   transfer_levels: [-10, -5, -2, 0, 2, 5, 10]
+  action_mode: target        # target: bring station to a fill level | amount: move +-x bikes
+  target_fills: [0.2, 0.35, 0.5, 0.65, 0.8]
   init_mode: warm
   fleet_fill: 0.4
   overnight_rebalance: 0.3
@@ -29,6 +31,7 @@ env:
   w_lost: 1.0
   w_km: 0.2
   w_dock: 0.25
+  reward_mode: counterfactual   # reward relative to a no-truck shadow day with the same riders
   demand_scale: 1.0
   extra_features: true      # truck travel time + projected fill observations
 

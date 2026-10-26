@@ -37,30 +37,44 @@ class PPOPolicy:
         return int(a)
 
 
-def obs_dim_of(path: str | Path) -> int:
+def spaces_of(path: str | Path) -> tuple[int, int]:
     from stable_baselines3 import PPO
     from sb3_contrib import MaskablePPO
     try:
         m = MaskablePPO.load(path, device="cpu")
     except Exception:
         m = PPO.load(path, device="cpu")
-    return int(m.observation_space.shape[0])
+    return int(m.observation_space.shape[0]), int(m.action_space.n)
+
+
+def obs_dim_of(path: str | Path) -> int:
+    return spaces_of(path)[0]
 
 
 def env_for_model(path, cfg: EnvConfig, demand: DemandModel) -> RebalancingEnv:
     """Environment whose observation layout matches the saved model."""
     n = len(demand.station_ids)
-    dim = obs_dim_of(path)
+    dim, n_act = spaces_of(path)
     if dim == 6 * n + 3:
-        return RebalancingEnv(replace(cfg, extra_features=True), demand)
-    if dim == 4 * n + 3:
-        return RebalancingEnv(replace(cfg, extra_features=False), demand)
-    raise ValueError(f"{path}: observation dim {dim} does not match {n} stations")
+        cfg = replace(cfg, extra_features=True)
+    elif dim == 4 * n + 3:
+        cfg = replace(cfg, extra_features=False)
+    else:
+        raise ValueError(f"{path}: observation dim {dim} does not match {n} stations")
+    if n_act == n * (len(cfg.target_fills) + 1):
+        cfg = replace(cfg, action_mode="target")
+    elif n_act == n * len(cfg.transfer_levels):
+        cfg = replace(cfg, action_mode="amount")
+    else:
+        raise ValueError(f"{path}: {n_act} actions match neither action mode")
+    return RebalancingEnv(cfg, demand)
 
 
 def build_policies(cfg: EnvConfig, demand: DemandModel, models: dict[str, str],
                    tuned_path: str | Path | None = None, include_default_threshold=True):
     """Return [(policy, env)] for the baselines plus every named PPO model."""
+    model_cfg = cfg
+    cfg = replace(cfg, action_mode="amount")    # baselines speak the bike-amount action set
     base = RebalancingEnv(cfg, demand)
     out = [(NoRebalancing(base), base)]
     if include_default_threshold:
@@ -71,7 +85,7 @@ def build_policies(cfg: EnvConfig, demand: DemandModel, models: dict[str, str],
         params = json.loads(Path(tuned_path).read_text())["best"]
         out.append((ThresholdPolicy.from_params(env, params, "threshold_tuned"), env))
     for name, path in models.items():
-        env = env_for_model(path, cfg, demand)
+        env = env_for_model(path, model_cfg, demand)
         out.append((PPOPolicy(path, env, name), env))
     return out
 
@@ -83,7 +97,7 @@ def run_episode(env: RebalancingEnv, policy, seed: int) -> dict:
         obs, r, term, trunc, info = env.step(policy.act(obs))
         ret += r
         done = term or trunc
-    out = dict(info, ret=ret)
+    out = dict(info, ret=info["abs_ret"], train_ret=ret)   # ret = absolute reward (comparable)
     out["hourly_served"] = env.hourly_served.copy()
     out["hourly_demand"] = env.hourly_demand.copy()
     return out

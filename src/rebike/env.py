@@ -25,13 +25,23 @@ Observation (float32, dim 4N + 3; 6N + 3 with `extra_features`)
     truck travel time to each station / 30 min                (N)
     projected fill in 1 h = inv/cap + net inflow + in transit, clipped to [-0.5, 1.5]  (N)
 
-Action: Discrete(N * K), a = station * K + level
+Action: Discrete(N * K), a = station * K + level   (action_mode "amount", K = 7)
     station = where the truck drives next, level indexes `transfer_levels`
     (+x = drop x bikes from truck, -x = pick up x bikes; clipped to feasibility)
     `action_masks()` hides transfers that cannot be executed (for MaskablePPO).
 
-Reward per decision
+Reward per decision ("absolute")
     r = w_served * served - w_lost * lost - w_km * km_driven - w_dock * failed_docks
+"counterfactual": every day is simulated twice with the *same* pre-sampled riders,
+once with the truck and once without (shadow). Served / lost / failed counts are
+replaced by their difference to the shadow day. The shadow does not depend on the
+agent, so this only subtracts an action-independent term from the return (same
+optimal policy) while cancelling most of the demand noise.
+`info["abs_ret"]` always accumulates the absolute reward for evaluation.
+
+Rider demand of a day (Poisson counts per tick and the random numbers that pick
+destinations) is pre-sampled at reset, so every policy faces exactly the same
+riders on the same seed (common random numbers).
 """
 from __future__ import annotations
 
@@ -55,6 +65,8 @@ class EnvConfig:
     truck_speed_kmh: float = 18.0
     handling_min: float = 3.0
     transfer_levels: list = field(default_factory=lambda: [-10, -5, -2, 0, 2, 5, 10])
+    action_mode: str = "amount"        # "amount": move +-x bikes | "target": set station to a fill level
+    target_fills: list = field(default_factory=lambda: [0.2, 0.35, 0.5, 0.65, 0.8])
     init_mode: str = "warm"            # "warm" | "uniform"
     fleet_fill: float = 0.4            # bikes in system / total docks
     overnight_rebalance: float = 0.3   # warm mode: share of imbalance fixed overnight
@@ -67,6 +79,7 @@ class EnvConfig:
     w_lost: float = 1.0
     w_km: float = 0.2
     w_dock: float = 0.25
+    reward_mode: str = "absolute"      # "absolute" | "counterfactual" (relative to a no-truck shadow day)
 
 
 class RebalancingEnv(gym.Env):
@@ -79,8 +92,13 @@ class RebalancingEnv(gym.Env):
         self.N = len(self.m.station_ids)
         self.cap = self.m.capacity.astype(np.int64)
         self.levels = np.asarray(self.cfg.transfer_levels, dtype=np.int64)
-        self.K = len(self.levels)
-        self.zero_level = int(np.argmin(np.abs(self.levels)))
+        if self.cfg.action_mode == "target":
+            self.targets = np.asarray(self.cfg.target_fills, dtype=float)
+            self.K = len(self.targets) + 1      # last level = drive there without transferring
+            self.zero_level = self.K - 1
+        else:
+            self.K = len(self.levels)
+            self.zero_level = int(np.argmin(np.abs(self.levels)))
         self.horizon = (self.cfg.end_hour - self.cfg.start_hour) * 60
         self.ride_ticks = np.maximum(1, np.round(self.m.ride_min / self.cfg.tick_min)).astype(np.int64)
         self.max_ride = int(self.ride_ticks.max()) + 1
@@ -115,6 +133,11 @@ class RebalancingEnv(gym.Env):
         """
         mask = np.zeros((self.N, self.K), dtype=bool)
         mask[:, self.zero_level] = True
+        if self.cfg.action_mode == "target":
+            want = np.round(self.targets[None, :] * self.cap[:, None]) - self.inv[:, None]   # (N, K-1)
+            space = self.cfg.truck_capacity - self.truck_load
+            mask[:, :-1] = ((want >= 1) & (self.truck_load > 0)) | ((want <= -1) & (space > 0))
+            return mask.reshape(-1)
         drop_f = np.minimum(self.truck_load, self.cap - self.inv)                 # (N,)
         pick_f = np.minimum(self.cfg.truck_capacity - self.truck_load, self.inv)  # (N,)
         pos = np.sort(self.levels[self.levels > 0])
@@ -132,6 +155,8 @@ class RebalancingEnv(gym.Env):
         super().reset(seed=seed)
         rng = self.np_random
         self.day_scale = float(np.exp(rng.normal(0.0, self.cfg.demand_noise_sigma))) * self.cfg.demand_scale
+        self.pre_demand = self.pre_u = None
+        self.shadow = False
         if self.cfg.init_mode == "warm":
             self.inv = self._warm_start()
         else:
@@ -141,7 +166,13 @@ class RebalancingEnv(gym.Env):
         self.truck_load = self.cfg.truck_capacity // 2
         self.t = 0  # minutes since start_hour
         self.in_transit = np.zeros((self.n_ticks + self.max_ride + 1, self.N), dtype=np.int64)
-        self.stats = dict(served=0, lost=0, km=0.0, moved=0, failed_docks=0, demand=0)
+        self.stats = dict(served=0, lost=0, km=0.0, moved=0, failed_docks=0, demand=0, abs_ret=0.0)
+        self._presample_day()
+        self.shadow = self.cfg.reward_mode == "counterfactual"
+        if self.shadow:
+            self.sh_inv = self.inv.copy()
+            self.sh_transit = np.zeros_like(self.in_transit)
+            self.sh_stats = dict(served=0, lost=0, failed_docks=0)
         n_hours = self.cfg.end_hour - self.cfg.start_hour
         self.hourly_served = np.zeros(n_hours, dtype=np.int64)
         self.hourly_demand = np.zeros(n_hours, dtype=np.int64)
@@ -180,15 +211,17 @@ class RebalancingEnv(gym.Env):
         ticks = max(1, int(np.ceil(minutes / self.cfg.tick_min)))
 
         served = lost = failed = 0
+        sh = np.zeros(3)
         for _ in range(ticks):
             if self.t >= self.horizon:
                 break
-            s, l, f = self._simulate_tick()
+            s, l, f, s_sh = self._simulate_tick()
             served, lost, failed = served + s, lost + l, failed + f
+            sh += s_sh
 
         # truck arrives and transfers bikes
         self.truck_pos = target
-        delta = int(self.levels[lvl])
+        delta = self._transfer_request(target, lvl)
         if delta > 0:
             moved = min(delta, self.truck_load, self.cap[target] - self.inv[target])
             self.inv[target] += moved
@@ -203,49 +236,91 @@ class RebalancingEnv(gym.Env):
         self.stats["km"] += km
         self.stats["moved"] += int(moved)
         c = self.cfg
-        reward = c.w_served * served - c.w_lost * lost - c.w_km * km - c.w_dock * failed
+        abs_r = c.w_served * served - c.w_lost * lost - c.w_km * km - c.w_dock * failed
+        self.stats["abs_ret"] += abs_r
+        if self.shadow:
+            reward = (c.w_served * (served - sh[0]) - c.w_lost * (lost - sh[1])
+                      - c.w_km * km - c.w_dock * (failed - sh[2]))
+        else:
+            reward = abs_r
         terminated = self.t >= self.horizon
         return self._obs(), float(reward), terminated, False, self._info()
 
+    def _transfer_request(self, station: int, lvl: int) -> int:
+        """Signed number of bikes the action asks to move (+ drop off, - pick up)."""
+        if self.cfg.action_mode == "target":
+            if lvl == self.zero_level:
+                return 0
+            return int(round(self.targets[lvl] * self.cap[station])) - int(self.inv[station])
+        return int(self.levels[lvl])
+
     # ------------------------------------------------------------------ #
-    def _dock(self, arrivals: np.ndarray) -> int:
+    def _dock(self, arrivals: np.ndarray, inv: np.ndarray | None = None) -> int:
         """Dock returning bikes; overflow goes to the nearest station with room."""
-        dock = np.minimum(arrivals, self.cap - self.inv)
-        self.inv += dock
+        inv = self.inv if inv is None else inv
+        dock = np.minimum(arrivals, self.cap - inv)
+        inv += dock
         spill_vec = arrivals - dock
         failed = int(spill_vec.sum())
         for j in np.nonzero(spill_vec)[0]:
             spill = int(spill_vec[j])
             for alt in self.nearest[j][1:]:
-                put = min(spill, self.cap[alt] - self.inv[alt])
-                self.inv[alt] += put
+                put = min(spill, self.cap[alt] - inv[alt])
+                inv[alt] += put
                 spill -= put
                 if spill == 0:
                     break
         return failed
 
-    def _simulate_tick(self):
+    def _presample_day(self):
+        """Draw the whole day's riders up front (common random numbers)."""
         rng = self.np_random
+        hours = (self.cfg.start_hour + np.arange(self.n_ticks) * self.cfg.tick_min // 60) % 24
+        lam = self.m.dep_rate[hours] * self.day_scale * self.cfg.tick_min / 60.0   # (T, N)
+        self.pre_demand = rng.poisson(lam)
+        self.pre_u = rng.random((self.n_ticks, self.N, max(1, int(self.pre_demand.max()))))
+
+    def _rentals(self, inv, in_transit, k, h, demand, u_tick):
+        """Serve rentals where bikes are available and send riders on their way."""
+        served_vec = np.minimum(demand, inv)
+        inv -= served_vec
+        served = int(served_vec.sum())
+        if served:
+            origins = np.repeat(np.arange(self.N), served_vec)
+            if u_tick is None:
+                u = self.np_random.random(served)
+            else:   # rider r at station i uses its own pre-drawn number u[i, r]
+                rank = np.arange(served) - np.repeat(np.cumsum(served_vec) - served_vec, served_vec)
+                u = u_tick[origins, rank]
+            dests = np.minimum((u[:, None] > self.od_cdf[h, origins]).sum(1), self.N - 1)
+            np.add.at(in_transit, (k + self.ride_ticks[origins, dests], dests), 1)
+        return served_vec
+
+    def _simulate_tick(self):
         k = self.t // self.cfg.tick_min
         h = (self.cfg.start_hour + self.t // 60) % 24
 
-        # 1) returns
+        # 1) returns (overflow -> nearest free dock)
         failed = self._dock(self.in_transit[k])
 
         # 2) rentals: Poisson demand, served only if a bike is available
-        lam = self.m.dep_rate[h] * self.day_scale * self.cfg.tick_min / 60.0
-        demand = rng.poisson(lam)
-        served_vec = np.minimum(demand, self.inv)
-        self.inv -= served_vec
+        if self.pre_demand is not None:
+            demand, u_tick = self.pre_demand[k], self.pre_u[k]
+        else:   # warm-start day: sampled on the fly
+            lam = self.m.dep_rate[h] * self.day_scale * self.cfg.tick_min / 60.0
+            demand, u_tick = self.np_random.poisson(lam), None
+        served_vec = self._rentals(self.inv, self.in_transit, k, h, demand, u_tick)
         lost = int((demand - served_vec).sum())
         served = int(served_vec.sum())
 
-        # 3) route served riders to destinations
-        if served:
-            origins = np.repeat(np.arange(self.N), served_vec)
-            u = rng.random(served)[:, None]
-            dests = np.minimum((u > self.od_cdf[h, origins]).sum(1), self.N - 1)
-            np.add.at(self.in_transit, (k + self.ride_ticks[origins, dests], dests), 1)
+        # 3) shadow day without truck, same riders
+        sh = np.zeros(3)
+        if self.shadow:
+            f_sh = self._dock(self.sh_transit[k], self.sh_inv)
+            sv_sh = self._rentals(self.sh_inv, self.sh_transit, k, h, demand, u_tick)
+            sh[:] = (int(sv_sh.sum()), int((demand - sv_sh).sum()), f_sh)
+            self.sh_stats["served"] += int(sh[0]); self.sh_stats["lost"] += int(sh[1])
+            self.sh_stats["failed_docks"] += int(sh[2])
 
         self.stats["served"] += served
         self.stats["lost"] += lost
@@ -255,7 +330,7 @@ class RebalancingEnv(gym.Env):
             self.hourly_served[self.t // 60] += served
             self.hourly_demand[self.t // 60] += int(demand.sum())
         self.t += self.cfg.tick_min
-        return served, lost, failed
+        return served, lost, failed, sh
 
     # ------------------------------------------------------------------ #
     def _obs(self):

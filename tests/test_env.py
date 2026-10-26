@@ -130,3 +130,50 @@ def test_demand_scale_increases_demand(toy_model):
             d += info["demand"]
         tot.append(d)
     assert tot[1] > 2 * tot[0]
+
+
+def test_target_mode_masks_and_transfers(toy_model):
+    from dataclasses import replace
+    env = RebalancingEnv(replace(EnvConfig(), action_mode="target"), toy_model)
+    assert env.action_space.n == env.N * (len(env.cfg.target_fills) + 1)
+    rng = np.random.default_rng(5)
+    for s in range(10):
+        env.reset(seed=s)
+        total = env.inv.sum() + env.truck_load
+        for _ in range(15):
+            mask = env.action_masks()
+            assert mask.reshape(env.N, env.K)[:, env.zero_level].all()
+            a = int(rng.choice(np.nonzero(mask)[0]))
+            env.step(a)
+            assert (env.inv >= 0).all() and (env.inv <= env.cap).all()
+            assert 0 <= env.truck_load <= env.cfg.truck_capacity
+        k = env.t // env.cfg.tick_min
+        assert env.inv.sum() + env.truck_load + env.in_transit[k:].sum() == total
+
+
+def test_counterfactual_reward_is_zero_for_idle_truck(toy_model):
+    from dataclasses import replace
+    env = RebalancingEnv(replace(EnvConfig(), reward_mode="counterfactual"), toy_model)
+    for s in range(3):
+        env.reset(seed=s)
+        total, done = 0.0, False
+        while not done:   # stay put, never transfer: identical to the shadow day
+            _, r, done, _, info = env.step(env.encode(env.truck_pos, env.zero_level))
+            total += r
+        assert abs(total) < 1e-9
+        assert info["lost"] == env.sh_stats["lost"]
+        assert abs(info["abs_ret"] + info["lost"] + 0.25 * info["failed_docks"]) < 1e-6
+
+
+def test_common_random_numbers(toy_model):
+    """Same seed -> same riders (demand) whatever the policy does."""
+    from rebike.baselines import NoRebalancing, ThresholdPolicy
+    env = RebalancingEnv(EnvConfig(), toy_model)
+    demands = []
+    for cls in (NoRebalancing, ThresholdPolicy):
+        obs, _ = env.reset(seed=11)
+        pol, done = cls(env), False
+        while not done:
+            obs, _, done, _, info = env.step(pol.act(obs))
+        demands.append(info["demand"])
+    assert demands[0] == demands[1]
