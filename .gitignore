@@ -20,3 +20,11 @@ results/tb/
 .idea/
 documentation/*.pdf
 results/train_log.txt
+
+# LaTeX build files
+report/*.aux
+report/*.log
+report/*.fls
+report/*.fdb_latexmk
+report/*.out
+results/train_log*.txt
